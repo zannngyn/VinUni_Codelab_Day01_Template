@@ -1,243 +1,141 @@
-"""
-Day 1 — LLM API Foundation
-Test suite for student solutions and master keys.
-
-Run from the 02-lab/ folder:
-    pytest tests/ -v
-
-All external API calls are mocked — no real API keys or internet connection required.
-"""
+"""Offline tests for the Day 1 OpenRouter implementation."""
 
 import importlib.util
 import os
+import subprocess
 import sys
-import unittest
 from pathlib import Path
-from unittest.mock import MagicMock, patch
+from types import SimpleNamespace
+from unittest.mock import patch
 
-# Locate directories relative to this test file
-TESTS_DIR = Path(__file__).parent
-LAB_DIR = TESTS_DIR.parent
-
-# Resolve module paths
-SOLUTION_PATH = LAB_DIR / "solution-code" / "solution.py"
-TEMPLATE_PATH = LAB_DIR / "starter-code" / "template.py"
-
-def _load_module(path: Path, unique_name: str):
-    if not path.exists():
-        raise FileNotFoundError(f"Target file not found at: {path}")
-    spec = importlib.util.spec_from_file_location(unique_name, str(path))
-    mod = importlib.util.module_from_spec(spec)
-    sys.modules[unique_name] = mod
-    spec.loader.exec_module(mod)
-    return mod
+import pytest
 
 
-# Dynamically load the solution module if it exists (for grading), otherwise test the starter template
-if SOLUTION_PATH.exists():
-    _m = _load_module(SOLUTION_PATH, "solution")
-else:
-    _m = _load_module(TEMPLATE_PATH, "template")
-
-# Import target functions
-call_openai = getattr(_m, "call_openai")
-call_gemini = getattr(_m, "call_gemini")
-call_anthropic = getattr(_m, "call_anthropic")
-compare_models = getattr(_m, "compare_models")
-streaming_chatbot = getattr(_m, "streaming_chatbot")
-retry_with_backoff = getattr(_m, "retry_with_backoff")
-batch_compare = getattr(_m, "batch_compare")
-format_comparison_table = getattr(_m, "format_comparison_table")
+TEMPLATE_PATH = Path(__file__).parents[1] / "starter-code" / "template.py"
+spec = importlib.util.spec_from_file_location("day1_template", TEMPLATE_PATH)
+template = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(template)
 
 
-# ---------------------------------------------------------------------------
-# Mock Generators
-# ---------------------------------------------------------------------------
-def _make_openai_response(text: str = "Hello from OpenAI"):
-    choice = MagicMock()
-    choice.message.content = text
-    resp = MagicMock()
-    resp.choices = [choice]
-    usage = MagicMock()
-    usage.prompt_tokens = 10
-    usage.completion_tokens = 20
-    resp.usage = usage
-    return resp
+def completion(text="answer", prompt_tokens=10, completion_tokens=20):
+    return SimpleNamespace(
+        choices=[SimpleNamespace(message=SimpleNamespace(content=text))],
+        usage=SimpleNamespace(prompt_tokens=prompt_tokens, completion_tokens=completion_tokens),
+    )
 
 
-def _make_gemini_response(text: str = "Hello from Gemini"):
-    resp = MagicMock()
-    resp.text = text
-    usage = MagicMock()
-    usage.prompt_token_count = 12
-    usage.candidates_token_count = 25
-    resp.usage_metadata = usage
-    return resp
+@pytest.mark.parametrize(
+    "function,model",
+    [
+        ("call_openai", "openai/gpt-4o-mini"),
+        ("call_gemini", "google/gemini-3.1-flash-lite"),
+        ("call_anthropic", "anthropic/claude-haiku-5.5"),
+    ],
+)
+def test_provider_calls_use_one_openrouter_key(function, model):
+    with patch.dict(os.environ, {"OPENROUTER_API_KEY": "test-key"}), patch("openai.OpenAI") as client_class:
+        client_class.return_value.chat.completions.create.return_value = completion()
+        text, latency, usage = getattr(template, function)(
+            "Hello", temperature=0.4, top_p=0.8, max_tokens=42
+        )
+
+    assert text == "answer"
+    assert latency >= 0
+    assert usage == {"input_tokens": 10, "output_tokens": 20}
+    assert client_class.call_args.kwargs == {
+        "base_url": "https://openrouter.ai/api/v1",
+        "api_key": "test-key",
+    }
+    call = client_class.return_value.chat.completions.create.call_args
+    assert call.kwargs["model"] == model
+    assert call.kwargs["messages"] == [{"role": "user", "content": "Hello"}]
+    assert call.kwargs["temperature"] == 0.4
+    assert call.kwargs["top_p"] == 0.8
+    assert call.kwargs["max_completion_tokens"] == 42
 
 
-def _make_anthropic_response(text: str = "Hello from Anthropic"):
-    resp = MagicMock()
-    content_part = MagicMock()
-    content_part.text = text
-    resp.content = [content_part]
-    usage = MagicMock()
-    usage.input_tokens = 15
-    usage.output_tokens = 30
-    resp.usage = usage
-    return resp
+def test_missing_openrouter_key_fails_before_request():
+    with patch.dict(os.environ, {"OPENROUTER_API_KEY": ""}), patch("openai.OpenAI") as client_class:
+        with pytest.raises(ValueError, match="OPENROUTER_API_KEY"):
+            template.call_openai("Hello")
+    client_class.assert_not_called()
 
 
-# ---------------------------------------------------------------------------
-# Test Cases
-# ---------------------------------------------------------------------------
-class TestCallOpenAI(unittest.TestCase):
-
-    @patch("openai.OpenAI")
-    def test_openai_returns_tuple_structure(self, MockOpenAI):
-        mock_client = MagicMock()
-        MockOpenAI.return_value = mock_client
-        mock_client.chat.completions.create.return_value = _make_openai_response("OpenAI Mock Response")
-
-        text, latency, usage = call_openai("Hello")
-
-        self.assertEqual(text, "OpenAI Mock Response")
-        self.assertIsInstance(latency, float)
-        self.assertGreaterEqual(latency, 0.0)
-        self.assertEqual(usage["input_tokens"], 10)
-        self.assertEqual(usage["output_tokens"], 20)
+def test_direct_system_python_run_uses_project_venv():
+    env = {**os.environ, "OPENROUTER_API_KEY": ""}
+    result = subprocess.run(
+        [sys._base_executable, "-S", str(TEMPLATE_PATH)],
+        cwd=TEMPLATE_PATH.parent.parent,
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
+    assert result.returncode == 0
+    assert "Set OPENROUTER_API_KEY" in result.stdout
+    assert "ModuleNotFoundError" not in result.stderr
 
 
-class TestCallGemini(unittest.TestCase):
+def test_compare_models_uses_three_providers_and_current_estimate_rates():
+    usage = {"input_tokens": 10, "output_tokens": 20}
+    with patch.object(template, "call_openai", return_value=("O", 0.1, usage)), \
+         patch.object(template, "call_gemini", return_value=("G", 0.2, usage)), \
+         patch.object(template, "call_anthropic", return_value=("A", 0.3, usage)):
+        result = template.compare_models("Prompt")
 
-    @patch("google.genai.Client")
-    def test_gemini_returns_tuple_structure_new_sdk(self, MockGenAIClient):
-        mock_client = MagicMock()
-        MockGenAIClient.return_value = mock_client
-        mock_client.models.generate_content.return_value = _make_gemini_response("Gemini Mock Response")
-
-        text, latency, usage = call_gemini("Hello")
-
-        self.assertEqual(text, "Gemini Mock Response")
-        self.assertIsInstance(latency, float)
-        self.assertGreaterEqual(latency, 0.0)
-        self.assertEqual(usage["input_tokens"], 12)
-        self.assertEqual(usage["output_tokens"], 25)
+    assert set(result) == {"openai", "gemini", "anthropic"}
+    assert result["openai"]["cost"] == pytest.approx(0.0000135)
+    assert result["gemini"]["cost"] == pytest.approx(0.0000325)
+    assert result["anthropic"]["cost"] == pytest.approx(0.000011)
+    assert result["anthropic"]["response"] == "A"
 
 
-class TestCallAnthropic(unittest.TestCase):
+def test_streaming_chatbot_keeps_last_three_turns(capsys):
+    inputs = iter(["Q1", "Q2", "Q3", "Q4", "Q5", "exit"])
 
-    @patch("anthropic.Anthropic")
-    def test_anthropic_returns_tuple_structure(self, MockAnthropic):
-        mock_client = MagicMock()
-        MockAnthropic.return_value = mock_client
-        mock_client.messages.create.return_value = _make_anthropic_response("Claude Mock Response")
+    def stream_for_call(**kwargs):
+        answer = "A" + kwargs["messages"][-1]["content"][1:]
+        return [SimpleNamespace(choices=[SimpleNamespace(delta=SimpleNamespace(content=answer))])]
 
-        text, latency, usage = call_anthropic("Hello")
+    with patch.dict(os.environ, {"OPENROUTER_API_KEY": "test-key"}), \
+         patch("openai.OpenAI") as client_class, \
+         patch("builtins.input", side_effect=lambda _: next(inputs)):
+        client_class.return_value.chat.completions.create.side_effect = stream_for_call
+        template.streaming_chatbot()
 
-        self.assertEqual(text, "Claude Mock Response")
-        self.assertIsInstance(latency, float)
-        self.assertGreaterEqual(latency, 0.0)
-        self.assertEqual(usage["input_tokens"], 15)
-        self.assertEqual(usage["output_tokens"], 30)
-
-
-class TestCompareModels(unittest.TestCase):
-
-    def test_compare_models_evaluates_correct_costs(self):
-        with patch.object(_m, "call_openai") as mock_openai, \
-             patch.object(_m, "call_gemini") as mock_gemini:
-             
-            # Setup mock returns
-            mock_openai.side_effect = [
-                ("GPT-4o Response", 0.5, {"input_tokens": 10, "output_tokens": 20}),       # 1st call: gpt-4o
-                ("GPT-4o-Mini Response", 0.3, {"input_tokens": 10, "output_tokens": 20}),  # 2nd call: gpt-4o-mini
-            ]
-            mock_gemini.return_value = (
-                "Gemini Response",
-                0.4,
-                {"input_tokens": 10, "output_tokens": 20}
-            )
-
-            result = compare_models("Prompt")
-
-            # Verify keys exist
-            self.assertIn("gpt4o", result)
-            self.assertIn("gpt4o_mini", result)
-            self.assertIn("gemini_flash", result)
-
-            # Verify exact cost calculations
-            # gpt-4o: (10 * 5.0 + 20 * 20.0) / 1,000,000 = 0.00045
-            self.assertAlmostEqual(result["gpt4o"]["cost"], 0.00045, places=8)
-            
-            # gpt-4o-mini: (10 * 0.150 + 20 * 0.600) / 1,000,000 = 0.0000135
-            self.assertAlmostEqual(result["gpt4o_mini"]["cost"], 0.0000135, places=8)
-            
-            # gemini-2.5-flash: (10 * 0.075 + 20 * 0.300) / 1,000,000 = 0.00000675
-            self.assertAlmostEqual(result["gemini_flash"]["cost"], 0.00000675, places=8)
+    calls = client_class.return_value.chat.completions.create.call_args_list
+    assert len(calls) == 5
+    assert all(call.kwargs["stream"] is True for call in calls)
+    assert [item["content"] for item in calls[-1].kwargs["messages"]] == [
+        "Q2", "A2", "Q3", "A3", "Q4", "A4", "Q5"
+    ]
+    assert "A5" in capsys.readouterr().out
 
 
-class TestRetryWithBackoff(unittest.TestCase):
+def test_retry_with_backoff_uses_exponential_delays():
+    attempts = []
 
-    def test_succeeds_immediately(self):
-        val = retry_with_backoff(lambda: "success")
-        self.assertEqual(val, "success")
+    def fail():
+        attempts.append(1)
+        raise RuntimeError("failure")
 
-    def test_succeeds_after_retries(self):
-        state = {"attempts": 0}
-
-        def flaky_fn():
-            state["attempts"] += 1
-            if state["attempts"] < 3:
-                raise ValueError("Fail")
-            return "ok"
-
-        val = retry_with_backoff(flaky_fn, max_retries=3, base_delay=0.001)
-        self.assertEqual(val, "ok")
-        self.assertEqual(state["attempts"], 3)
-
-    def test_raises_permanent_exception(self):
-        def permanent_fail():
-            raise RuntimeError("Permanent")
-
-        with self.assertRaises(RuntimeError):
-            retry_with_backoff(permanent_fail, max_retries=2, base_delay=0.001)
+    with patch.object(template.time, "sleep") as sleep:
+        with pytest.raises(RuntimeError, match="failure"):
+            template.retry_with_backoff(fail, max_retries=3, base_delay=0.25)
+    assert len(attempts) == 4
+    assert [call.args[0] for call in sleep.call_args_list] == [0.25, 0.5, 1.0]
 
 
-class TestBatchCompareAndFormat(unittest.TestCase):
-
-    def test_batch_runs_and_formats_table(self):
-        with patch.object(_m, "compare_models") as mock_comp:
-            def _get_mock():
-                return {
-                    "gpt4o": {"response": "GPT-4o response content here", "latency": 0.5, "cost": 0.00045, "input_tokens": 10, "output_tokens": 20},
-                    "gpt4o_mini": {"response": "GPT-4o-Mini response content here", "latency": 0.3, "cost": 0.0000135, "input_tokens": 10, "output_tokens": 20},
-                    "gemini_flash": {"response": "Gemini response content here", "latency": 0.4, "cost": 0.00000675, "input_tokens": 10, "output_tokens": 20}
-                }
-            mock_comp.side_effect = _get_mock
-
-            results = batch_compare(["Q1", "Q2"])
-            self.assertEqual(len(results), 2)
-            self.assertEqual(results[0]["prompt"], "Q1")
-
-            table = format_comparison_table(results)
-            self.assertIsInstance(table, str)
-            self.assertIn("Prompt", table)
-            self.assertIn("GPT-4o", table)
-            self.assertIn("Gemini-Flash", table)
-            self.assertIn("Q1", table)
-
-
-class TestStreamingChatbot(unittest.TestCase):
-
-    @patch("builtins.input", side_effect=["quit"])
-    @patch("google.genai.Client")
-    def test_exits_cleanly(self, MockClient, mock_input):
-        # Ensure it quits cleanly without entering infinite loop
-        try:
-            streaming_chatbot()
-        except SystemExit:
-            pass
-
-
-if __name__ == "__main__":
-    unittest.main()
+def test_batch_and_table_include_all_models():
+    comparison = {
+        key: {"response": key, "latency": 0.1, "cost": 0.00001, "input_tokens": 10, "output_tokens": 20}
+        for key in ("openai", "gemini", "anthropic")
+    }
+    with patch.object(template, "compare_models", return_value=comparison):
+        results = template.batch_compare(["Question"])
+    assert results[0]["prompt"] == "Question"
+    table = template.format_comparison_table(results)
+    assert "Question" in table
+    assert "GPT-4o mini" in table
+    assert "Gemini 3.1 Flash Lite" in table
+    assert "Claude Haiku 5.5" in table
